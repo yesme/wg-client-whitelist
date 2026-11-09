@@ -83,6 +83,7 @@ Fix: add the range to the generator's exemption list, regenerate, re-import.
 | `scripts/verify_cdn.ps1` | Three-way verification for candidate domains (china-list + live resolve + IP geo). |
 | `scripts/nrpt_install.ps1` | Installs the delta between `lists/nrpt_domains.txt` and live NRPT rules (elevated). |
 | `lists/nrpt_domains.txt` | The suffix master list (one registrable domain per line). |
+| `lists/allowedips_cn_split.txt` | Pre-baked AllowedIPs prefix list (848 routes, one per line) — the aggregated via-VPN complement of the direct set. Paste it into a `WireGuard` tunnel's `AllowedIPs` (comma-joined) as a ready-to-use alternative to running `gen_wg_split.py`, or diff it against your own generation. Snapshot; regenerate monthly for fresh allocations. |
 | `lists/nrpt_overrides.txt` | Suffixes intentionally overridden to the tunnel resolver. |
 
 ## Quick start
