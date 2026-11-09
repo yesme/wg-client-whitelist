@@ -1,0 +1,9 @@
+# data files are auto-downloaded by the generators
+china_accel.conf
+*.log
+tmp_*/
+__pycache__/
+*.pyc
+# never commit tunnel configs (they contain keys)
+*.conf
+!lists/*.txt
