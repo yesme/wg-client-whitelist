@@ -71,13 +71,16 @@ for a, b in merged:
 TOTAL_CN = cum[-1]
 
 def cn_le(x):
+    """Count CN addresses <= x. cum[k] = total of merged[0:k] (exclusive of
+    the k-th interval), so inside interval i: cum[i] + (x - starts[i] + 1);
+    past interval i: cum[i + 1]. (A prior 'subtract the tail' form had an
+    off-by-one producing negative counts on large merged intervals.)"""
     i = bisect.bisect_right(starts, x) - 1
     if i < 0:
         return 0
-    r = cum[i]
-    if ends[i] >= x:
-        r -= ends[i] - x
-    return r
+    if x <= ends[i]:
+        return cum[i] + (x - starts[i] + 1)
+    return cum[i + 1]
 
 FDi = [(int(n.network_address), int(n.broadcast_address))
        for n in [ipaddress.ip_network(x) for x in HARD_DIRECT + PINNED_DIRECT]]
