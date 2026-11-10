@@ -1,164 +1,259 @@
 #!/usr/bin/env python3
-"""Generate a full-CN-direct split-tunnel WireGuard config.
+"""Hole-model WireGuard split generator (hole model, successor of the
+registry-only v4 generator).
 
-Reads your ORIGINAL full-tunnel .conf (keys are read, never printed),
-rewrites AllowedIPs as the aggregated complement of the direct set:
+WireGuard AllowedIPs is ALLOW-ONLY: the config is 'whole IPv4 minus holes'.
+A HOLE is a range kept DIRECT (off the tunnel). Design goals, in priority
+order:
+  1. mandatory holes always direct: LAN/CGNAT/Tailscale/loopback/etc + any
+     pinned domestic resolvers you list;
+  2. mainland-CN carrier core: APNIC-registered CN allocations <= --p;
+  3. blind-spot healing: foreign-registered RIR blocks whose announced
+     address space originates >= --ratio from CN ASNs (RouteViews truth);
+  4. carrier families: all prefixes announced by your own carrier's ASNs
+     (keeps Tailscale P2P peer endpoints direct); other carriers' big
+     aggregates only (--carrier-cuct, default /16 - the knee of the curve);
+  5. curated traffic: RIR blocks hosting IPs from --curated-ips are holes;
+  6. prune (separate script audit_holes.py + dns_sweep.py): kill zero-traffic
+     small holes - small holes are FRAGMENT AMPLIFIERS (each splits adjacent
+     allow prefixes; removing lets them re-collapse).
+Merging is adjacent-only; never across foreign space. No literal /0 is
+emitted (wireguard-windows killswitch stays off). The tunnel inner subnet
+(auto-derived from the source conf's Address) stays IN AllowedIPs for
+cryptokey routing.
 
-  direct   = mainland-CN (APNIC) + Tailscale CGNAT + RFC1918/reserved
-             + pinned direct DNS resolvers + manual CN exemptions
-  via VPN  = everything else (enumerated prefixes, NO literal /0,
-             so wireguard-windows will not enable its killswitch)
+Data (auto-downloaded, cached in --data-dir):
+  5x RIR delegated files (ASN->country + v4 allocation blocks)
+  CAIDA RouteViews pfx2as snapshot (prefix->origin ASNs)
 
 Usage:
-  python3 gen_wg_split.py --source original.conf --out split.conf
-Options: --t / --K control aggregation greed; --max-prefixes the cap.
+  python3 gen_wg_split.py --source original.conf --out split.conf \
+      [--p 10] [--ratio 0.8] [--cuct 16] [--curated-ips ips.txt] \
+      [--cm-asns 9808,56040,...] [--max-prefixes 3500]
 """
 import argparse
 import bisect
+import gzip
 import ipaddress
+import os
 import re
-import sys
-import time
 import urllib.request
 
-APNIC = ("http://ftp.apnic.net/apnic/stats/apnic/"
-         "delegated-apnic-extended-latest")
+RIRS = {
+    "apnic": "http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-extended-latest",
+    "ripencc": "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest",
+    "arin": "https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest",
+    "lacnic": "https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest",
+    "afrinic": "https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest",
+}
+CAIDA_BASE = ("https://publicdata.caida.org/datasets/routing/"
+              "routeviews-prefix2as")
 
-# resolvers that must stay OFF the tunnel (domestic DNS pinned direct)
-PINNED_DIRECT = ["223.5.5.5/32", "223.6.6.6/32",
-                 "119.29.29.29/32", "120.53.53.53/32"]
-# chnroute blind spots: CN-hosted ranges registered outside APNIC
-# (market-transferred blocks). Add yours here after verifying geo+registry.
-EXEMPT_CN = [
-    "8.147.0.0/16",       # example: Alibaba Beijing via ARIN
-    "103.143.17.0/24",    # example: CN IDC behind a DDoS-proxy CNAME
-]
-HARD_DIRECT = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-               "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
-               "224.0.0.0/3"]
+MANDATORY = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+             "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+             "224.0.0.0/3")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--source", required=True, help="original full-tunnel .conf")
 ap.add_argument("--out", default="wg_cn_split.conf")
-ap.add_argument("--t", type=float, default=0.01,
-                help="swallow a mixed block into VPN if CN ratio <= t")
-ap.add_argument("--K", type=int, default=16384,
-                help="...or if it contains <= K CN addresses (long-tail cap)")
-ap.add_argument("--max-prefixes", type=int, default=1000)
+ap.add_argument("--data-dir", default="data")
+ap.add_argument("--p", type=int, default=10,
+                help="max prefixlen of CN registry allocations to hole")
+ap.add_argument("--ratio", type=float, default=0.8,
+                help="CN-origin coverage for foreign blocks to hole")
+ap.add_argument("--cuct", type=int, default=16,
+                help="other carriers: hole only announced aggregates <= this")
+ap.add_argument("--cm-asns", default="9808,56040,58453,9394,9231,24400",
+                help="your carrier's ASNs (comma list) - ALL prefixes direct")
+ap.add_argument("--cuct-asns", default="4837,9929,4808,4134,4811,4812,23724",
+                help="other carriers' ASNs - big aggregates only")
+ap.add_argument("--curated-ips", default=None,
+                help="file of IPs (one per line) whose blocks must be direct")
+ap.add_argument("--pin-dns", default="223.5.5.5/32,119.29.29.29/32",
+                help="domestic reservers pinned direct (comma list)")
+ap.add_argument("--max-prefixes", type=int, default=3500)
 args = ap.parse_args()
 
-t0 = time.time()
-raw = urllib.request.urlopen(APNIC, timeout=90).read().decode("ascii", "replace")
+os.makedirs(args.data_dir, exist_ok=True)
 
-cn = []
-for line in raw.splitlines():
-    p = line.split("|")
-    if len(p) >= 5 and p[0] == "apnic" and p[1] == "CN" and p[2] == "ipv4":
-        a = int(ipaddress.IPv4Address(p[3]))
-        cn.append((a, a + int(p[4]) - 1))
-cn.sort()
-merged = []
-for a, b in cn:
-    if merged and a <= merged[-1][1] + 1:
-        merged[-1][1] = max(merged[-1][1], b)
-    else:
-        merged.append([a, b])
-starts = [a for a, _ in merged]
-ends = [b for _, b in merged]
-cum = [0]
-for a, b in merged:
-    cum.append(cum[-1] + b - a + 1)
-TOTAL_CN = cum[-1]
+def fetch(url, name):
+    path = os.path.join(args.data_dir, name)
+    if not os.path.exists(path):
+        print(f"downloading {name} ...", flush=True)
+        urllib.request.urlretrieve(url, path)
+    return path
 
-def cn_le(x):
-    """Count CN addresses <= x. cum[k] = total of merged[0:k] (exclusive of
-    the k-th interval), so inside interval i: cum[i] + (x - starts[i] + 1);
-    past interval i: cum[i + 1]. (A prior 'subtract the tail' form had an
-    off-by-one producing negative counts on large merged intervals.)"""
-    i = bisect.bisect_right(starts, x) - 1
-    if i < 0:
-        return 0
-    if x <= ends[i]:
-        return cum[i] + (x - starts[i] + 1)
-    return cum[i + 1]
+# ---------- RIR delegated: ASN->CC + v4 blocks ----------
+asn_cc = {}
+blocks = []          # (start, end, plen, cc, registry)
+for reg, url in RIRS.items():
+    path = fetch(url, f"delegated-{reg}.txt")
+    na = nb = 0
+    for line in open(path, encoding="ascii", errors="replace"):
+        p = line.split("|")
+        if len(p) < 7 or p[0] != reg:
+            continue
+        if p[2] == "asn" and p[6] in ("allocated", "assigned"):
+            for k in range(int(p[3]), int(p[3]) + int(p[4])):
+                asn_cc[k] = p[1]
+            na += 1
+        elif p[2] == "ipv4" and re.match(r"^\d+\.\d+\.\d+\.\d+$", p[3]):
+            a = int(ipaddress.IPv4Address(p[3]))
+            cnt = int(p[4])
+            blocks.append((a, a + cnt - 1,
+                           32 - (cnt.bit_length() - 1), p[1], reg))
+            nb += 1
+    print(f"  {reg}: +{na} ASNs, +{nb} v4 blocks", flush=True)
+blocks.sort()
+bstart = [b[0] for b in blocks]
+cn_asns = {a for a, cc in asn_cc.items() if cc == "CN"}
+print(f"ASNs: {len(asn_cc)} total, {len(cn_asns)} CN; "
+      f"v4 blocks: {len(blocks)}")
 
-FDi = [(int(n.network_address), int(n.broadcast_address))
-       for n in [ipaddress.ip_network(x) for x in HARD_DIRECT + PINNED_DIRECT]]
-# tunnel inner subnet, forced via VPN so the provider's own /24 stays
-# reachable through the tunnel; auto-derived from the source conf's Address
+def block_idx(x):
+    i = bisect.bisect_right(bstart, x) - 1
+    return i if i >= 0 and blocks[i][1] >= x else None
+
+# ---------- CAIDA pfx2as: announced prefixes -> origins ----------
+def latest_pfx2as():
+    import datetime
+    for back in range(1, 10):
+        d = datetime.date.today() - datetime.timedelta(days=back)
+        url = f"{CAIDA_BASE}/{d.year}/{d.month:02d}/"
+        try:
+            html = urllib.request.urlopen(url, timeout=60).read().decode(
+                "ascii", "replace")
+        except Exception:
+            continue
+        files = re.findall(r'routeviews-rv2-\d{8}-\d{4}\.pfx2as\.gz', html)
+        if files:
+            return url + sorted(files)[-1], sorted(files)[-1]
+    raise SystemExit("no CAIDA pfx2as snapshot found in the last 10 days")
+
+pfx_url, pfx_name = latest_pfx2as()
+pfx_path = fetch(pfx_url, pfx_name)
+cn_pfx = {}          # prefix -> set of CN origin asns
+total_ann = 0
+with gzip.open(pfx_path, "rt") as f:
+    for line in f:
+        parts = line.split("\t")
+        if len(parts) < 3 or not parts[1].strip().isdigit():
+            continue
+        pfx = parts[0] + "/" + parts[1].strip()
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+/\d+$", pfx):
+            continue
+        total_ann += 1
+        orig = {int(t) for t in re.split(r"[_{ },]+", parts[2].strip())
+                if t.isdigit()}
+        hit = orig & cn_asns
+        if hit:
+            cn_pfx[pfx] = hit
+print(f"announced v4: {total_ann}, CN-origin: {len(cn_pfx)}")
+
+# ---------- CN coverage per RIR block ----------
+cov = {}
+for p in cn_pfx:
+    n = ipaddress.ip_network(p)
+    i = block_idx(int(n.network_address))
+    if i is not None:
+        lo = max(int(n.network_address), blocks[i][0])
+        hi = min(int(n.broadcast_address), blocks[i][1])
+        if hi >= lo:
+            cov[i] = cov.get(i, 0) + (hi - lo + 1)
+
+# ---------- holes ----------
+holes = [ipaddress.ip_network(x) for x in MANDATORY]
+holes += [ipaddress.ip_network(x) for x in args.pin_dns.split(",")]
+
+def add_range(s, e):
+    holes.extend(ipaddress.summarize_address_range(
+        ipaddress.IPv4Address(s), ipaddress.IPv4Address(e)))
+
+n_reg = n_cov = 0
+for i, (s, e, pl, cc, reg) in enumerate(blocks):
+    if reg == "apnic" and cc == "CN" and pl <= args.p:
+        add_range(s, e); n_reg += 1
+    elif reg != "apnic" or cc != "CN":
+        if i in cov:
+            ratio = cov[i] / (e - s + 1)
+            if pl <= 10 or ratio >= args.ratio:
+                add_range(s, e); n_cov += 1
+print(f"registry CN <=/{args.p}: {n_reg} blocks; "
+      f"foreign CN-covered: {n_cov} blocks")
+
+CM = {int(x) for x in args.cm_asns.split(",")}
+CUCT = {int(x) for x in args.cuct_asns.split(",")}
+n_cm = n_cuct = 0
+for p, orig in cn_pfx.items():
+    if orig & CM:
+        holes.append(ipaddress.ip_network(p)); n_cm += 1
+    elif orig & CUCT and int(p.split("/")[1]) <= args.cuct:
+        holes.append(ipaddress.ip_network(p)); n_cuct += 1
+print(f"carrier families: own {n_cm} prefixes, others {n_cuct} (<=/{args.cuct})")
+
+if args.curated_ips:
+    n_cur = 0
+    for line in open(args.curated_ips):
+        ip = line.strip()
+        if not ip:
+            continue
+        i = block_idx(int(ipaddress.IPv4Address(ip)))
+        if i is not None:
+            s, e = blocks[i][0], blocks[i][1]
+            add_range(s, e); n_cur += 1
+    print(f"curated IPs: holed {n_cur} blocks")
+
+# ---------- tunnel subnet stays IN allow (cryptokey) ----------
 src_txt = open(args.source, encoding="utf-8").read()
 m = re.search(r"(?im)^Address\s*=\s*(\d+\.\d+\.\d+\.\d+)", src_txt)
 if not m:
-    sys.exit("cannot find 'Address =' in source conf; cannot derive subnet")
-_tun = ipaddress.ip_network(m.group(1) + "/24", strict=False)
-FVs, FVe = (int(_tun.network_address), int(_tun.broadcast_address))
-print(f"tunnel subnet (auto-derived): {_tun}")
+    raise SystemExit("cannot find 'Address =' in source conf")
+tun = ipaddress.ip_network(m.group(1) + "/24", strict=False)
+print(f"tunnel subnet (auto-derived): {tun}")
 
-def rec(s, depth, out, sw):
-    size = 1 << (32 - depth)
-    e = s + size - 1
-    fv = FVs <= e and s <= FVe
-    fd = any(zs <= e and s <= ze for zs, ze in FDi)
-    if fv:
-        if FVs <= s and e <= FVe:
-            out.append((s, depth)); return
-        if depth < 24:
-            h = size >> 1
-            rec(s, depth + 1, out, sw)
-            rec(s + h, depth + 1, out, sw)
-            return
-    if fd and any(zs <= s and e <= ze for zs, ze in FDi):
-        return
-    if fv or fd:
-        if depth < 24:
-            h = size >> 1
-            rec(s, depth + 1, out, sw)
-            rec(s + h, depth + 1, out, sw)
-        return
-    c = cn_le(e) - cn_le(s - 1)
-    if c <= 0:
-        out.append((s, depth))
-    elif c >= size:
-        return
-    elif c <= args.t * size or c <= args.K:
-        out.append((s, depth)); sw[0] += c
-    elif depth >= 24:
-        out.append((s, depth)); sw[0] += c
-    else:
-        h = size >> 1
-        rec(s, depth + 1, out, sw)
-        rec(s + h, depth + 1, out, sw)
+holes = [h for h in holes if not h.subnet_of(tun)]
+holes = list(ipaddress.collapse_addresses(holes))   # adjacent-only merge
+allow = []
+cur = 0
+LAST = int(ipaddress.IPv4Address("255.255.255.255"))
+for h in holes:
+    s, e = int(h.network_address), int(h.broadcast_address)
+    if s > cur:
+        allow += list(ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(cur), ipaddress.IPv4Address(s - 1)))
+    cur = max(cur, e + 1)
+if cur <= LAST:
+    allow += list(ipaddress.summarize_address_range(
+        ipaddress.IPv4Address(cur), ipaddress.IPv4Address(LAST)))
+allow.append(tun)
+allow = list(ipaddress.collapse_addresses(allow))
+print(f"holes={len(holes)} allow={len(allow)} prefixes")
+if len(allow) > args.max_prefixes:
+    raise SystemExit(f"over --max-prefixes ({len(allow)} > "
+                     f"{args.max_prefixes}); tune --p/--cuct or run "
+                     f"audit_holes.py to prune")
 
-print(f"CN merged ranges: {len(merged)}, total {TOTAL_CN/1e6:.1f}M addrs")
-out, sw = [], [0]
-rec(0, 0, out, sw)
-prefixes = list(ipaddress.collapse_addresses(
-    ipaddress.ip_network(f"{ipaddress.IPv4Address(s)}/{d}") for s, d in out))
-print(f"aggregated: {len(prefixes)} prefixes, CN swallowed "
-      f"{sw[0]:,} ({sw[0]/TOTAL_CN*100:.2f}%)")
-if len(prefixes) > args.max_prefixes:
-    sys.exit(f"over --max-prefixes ({len(prefixes)} > {args.max_prefixes}); "
-             "raise -t/-K or accept slower activation")
+# ---------- sanity ----------
+def via(ip):
+    return any(ipaddress.ip_address(ip) in a for a in allow)
+assert via("8.8.8.8") and via("1.1.1.1"), "foreign must ride the tunnel"
+assert not via("192.168.0.1") and not via("100.100.100.100"), \
+    "LAN/Tailscale must be direct"
+assert not via(args.pin_dns.split(",")[0].split("/")[0]), \
+    "pinned resolver must be direct"
+assert via(str(tun.network_address + 1)), "tunnel subnet must stay allowed"
+assert not any(a.prefixlen == 0 for a in allow), "no literal /0"
+print("sanity: OK")
 
-def covered(ip):
-    return any(ipaddress.ip_address(ip) in n for n in prefixes)
-assert not covered("223.5.5.5") and not covered("192.168.0.1")
-assert not covered("100.100.100.100"), "Tailscale MagicDNS must be direct"
-assert covered("8.8.8.8") and covered("1.1.1.1")
-print("sanity checks: OK")
-
-orig = src_txt
-if not re.search(r"(?im)^AllowedIPs\s*=", orig):
-    sys.exit("source conf has no AllowedIPs line")
-allowed = ", ".join(str(n) for n in prefixes)
-header = ("# AUTO-GENERATED split-tunnel: mainland-CN + Tailscale + private "
-          "+ pinned DNS direct; rest via VPN. NO literal /0 (killswitch off).\n"
-          f"# APNIC aggregated, {len(prefixes)} prefixes, "
-          f"generated {time.strftime('%Y-%m-%d %H:%M')}\n")
-new = re.sub(r"(?im)^AllowedIPs\s*=.*$", f"AllowedIPs = {allowed}", orig)
+# ---------- write ----------
+allowed = ", ".join(str(n) for n in allow)
+header = ("# HOLE MODEL: AllowedIPs = whole-v4 minus direct holes "
+          f"(mandatory + CN registry <=/{args.p} + foreign blocks "
+          f"CN-origin>={args.ratio} + carrier families + curated). "
+          f"{len(allow)} prefixes. Generated by gen_wg_split.py.\n")
+new = re.sub(r"(?im)^AllowedIPs\s*=.*$", f"AllowedIPs = {allowed}", src_txt)
 new = re.sub(r"(?im)^DNS\s*=.*$", "DNS = 1.1.1.1, 8.8.8.8", new)
 open(args.out, "w", encoding="utf-8").write(header + new)
-txt = open(args.out, encoding="utf-8").read()
-assert "PrivateKey" in txt and "AllowedIPs = 0.0.0.0/0" not in txt
-print(f"wrote {args.out} in {time.time()-t0:.1f}s "
-      "(NOTE: file contains your private key - keep it local)")
+assert "PrivateKey" in open(args.out, encoding="utf-8").read()
+print(f"wrote {args.out} (contains your private key - keep local)")
+print("next: dns_sweep.py + audit_holes.py to prune zero-traffic holes")

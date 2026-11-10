@@ -1,6 +1,10 @@
 # data files are auto-downloaded by the generators
 china_accel.conf
+data/
+*.gz
+*.zip
 *.log
+*.tsv
 tmp_*/
 __pycache__/
 *.pyc
