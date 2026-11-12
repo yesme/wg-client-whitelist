@@ -77,6 +77,9 @@ ap.add_argument("--cn-cloud-asns",
                      "whois name lookup, e.g. HUAWEI CLOUDS HK)")
 ap.add_argument("--pin-dns", default="223.5.5.5/32,119.29.29.29/32",
                 help="domestic reservers pinned direct (comma list)")
+ap.add_argument("--carve-ips", default=None,
+                help="file of IPs (blocklisted sites hosted on CN-registry "
+                     "space); their /24s are carved back INTO AllowedIPs")
 ap.add_argument("--max-prefixes", type=int, default=3500)
 args = ap.parse_args()
 
@@ -120,7 +123,12 @@ def block_idx(x):
     i = bisect.bisect_right(bstart, x) - 1
     return i if i >= 0 and blocks[i][1] >= x else None
 
-# ---------- CAIDA pfx2as: announced prefixes -> origins ----------
+# CN-registered ASNs whose POPs are largely OVERSEAS (intl arms): exclude
+# from block-coverage math (their intl POP blocks must ride the tunnel —
+# the okx/binance/futu/longbridge lesson: blocked exchanges sit on these).
+# They still feed carrier families & curated islands where appropriate.
+INTL_ARM_ASNS = {45102, 132203, 55967, 134565}
+
 def latest_pfx2as():
     import datetime
     for back in range(1, 10):
@@ -153,11 +161,11 @@ with gzip.open(pfx_path, "rt") as f:
         total_ann += 1
         orig = {int(t) for t in re.split(r"[_{ },]+", parts[2].strip())
                 if t.isdigit()}
-        hit = orig & cn_asns
+        hit = orig & (cn_asns - INTL_ARM_ASNS)
         if hit:
             cn_pfx[pfx] = hit
-        elif orig & cloud_asns:
-            cloud_pfx[pfx] = orig & cloud_asns
+        elif orig & (cloud_asns | INTL_ARM_ASNS):
+            cloud_pfx[pfx] = orig & (cloud_asns | INTL_ARM_ASNS)
 print(f"announced v4: {total_ann}, CN-origin: {len(cn_pfx)}, "
       f"CN-cloud intl islands: {len(cloud_pfx)}")
 
@@ -194,13 +202,23 @@ print(f"registry CN <=/{args.p}: {n_reg} blocks; "
 
 CM = {int(x) for x in args.cm_asns.split(",")}
 CUCT = {int(x) for x in args.cuct_asns.split(",")}
+def reg_cn_ip(ip):
+    """True if the covering RIR allocation is registry-CN — carrier holes
+    are restricted to it (else CMI/CT-intl transit of foreign CDNs, e.g.
+    CloudFront HK edges, sweeps global CDNs into direct)."""
+    i = block_idx(int(ipaddress.IPv4Address(ip)))
+    return i is not None and blocks[i][3] == "CN" and blocks[i][4] == "apnic"
 n_cm = n_cuct = 0
 for p, orig in cn_pfx.items():
+    net = ipaddress.ip_network(p)
+    if not reg_cn_ip(str(net.network_address)):
+        continue
     if orig & CM:
-        holes.append(ipaddress.ip_network(p)); n_cm += 1
-    elif orig & CUCT and int(p.split("/")[1]) <= args.cuct:
-        holes.append(ipaddress.ip_network(p)); n_cuct += 1
-print(f"carrier families: own {n_cm} prefixes, others {n_cuct} (<=/{args.cuct})")
+        holes.append(net); n_cm += 1
+    elif orig & CUCT and net.prefixlen <= args.cuct:
+        holes.append(net); n_cuct += 1
+print(f"carrier families (registry-CN space only): own {n_cm}, "
+      f"others {n_cuct} (<=/{args.cuct})")
 
 if args.curated_ips:
     # Triage per curated IP (the jdstatic/Cloudflare lesson: never hole a
@@ -265,6 +283,21 @@ if cur <= LAST:
         ipaddress.IPv4Address(cur), ipaddress.IPv4Address(LAST)))
 allow.append(tun)
 allow = list(ipaddress.collapse_addresses(allow))
+
+if args.carve_ips:
+    # Blocklisted sites hosted on CN-registry space: carve their /24s back
+    # INTO AllowedIPs (they need the tunnel: direct = SNI-filtered).
+    n_carve = 0
+    for line in open(args.carve_ips):
+        ip = line.strip()
+        if not ip:
+            continue
+        o = int(ipaddress.IPv4Address(ip)) & ~255
+        allow.append(ipaddress.ip_network(
+            f"{ipaddress.IPv4Address(o)}/24"))
+        n_carve += 1
+    allow = list(ipaddress.collapse_addresses(allow))
+    print(f"carved {n_carve} blocklisted /24s into the tunnel side")
 print(f"holes={len(holes)} allow={len(allow)} prefixes")
 if len(allow) > args.max_prefixes:
     raise SystemExit(f"over --max-prefixes ({len(allow)} > "
