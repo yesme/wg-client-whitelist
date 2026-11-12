@@ -69,6 +69,12 @@ ap.add_argument("--cuct-asns", default="4837,9929,4808,4134,4811,4812,23724",
                 help="other carriers' ASNs - big aggregates only")
 ap.add_argument("--curated-ips", default=None,
                 help="file of IPs (one per line) whose blocks must be direct")
+ap.add_argument("--cn-cloud-asns",
+                default="136907,45102,132203,135377,55967,55990",
+                help="CN clouds' INTERNATIONAL arms (HK/SG/US-registered) "
+                     "that still operate mainland POPs; their announced "
+                     "prefixes count as islands (find yours via Cymru "
+                     "whois name lookup, e.g. HUAWEI CLOUDS HK)")
 ap.add_argument("--pin-dns", default="223.5.5.5/32,119.29.29.29/32",
                 help="domestic reservers pinned direct (comma list)")
 ap.add_argument("--max-prefixes", type=int, default=3500)
@@ -132,7 +138,9 @@ def latest_pfx2as():
 
 pfx_url, pfx_name = latest_pfx2as()
 pfx_path = fetch(pfx_url, pfx_name)
+cloud_asns = {int(x) for x in args.cn_cloud_asns.split(",")}
 cn_pfx = {}          # prefix -> set of CN origin asns
+cloud_pfx = {}       # prefix -> CN-cloud intl-arm origins (island class)
 total_ann = 0
 with gzip.open(pfx_path, "rt") as f:
     for line in f:
@@ -148,7 +156,10 @@ with gzip.open(pfx_path, "rt") as f:
         hit = orig & cn_asns
         if hit:
             cn_pfx[pfx] = hit
-print(f"announced v4: {total_ann}, CN-origin: {len(cn_pfx)}")
+        elif orig & cloud_asns:
+            cloud_pfx[pfx] = orig & cloud_asns
+print(f"announced v4: {total_ann}, CN-origin: {len(cn_pfx)}, "
+      f"CN-cloud intl islands: {len(cloud_pfx)}")
 
 # ---------- CN coverage per RIR block ----------
 cov = {}
@@ -202,7 +213,7 @@ if args.curated_ips:
     #     rides the tunnel by doctrine)
     cn_ann = sorted((int(ipaddress.ip_network(p).network_address),
                      int(ipaddress.ip_network(p).broadcast_address))
-                    for p in cn_pfx)
+                    for p in list(cn_pfx) + list(cloud_pfx))
     cn_ann_st = [a for a, _ in cn_ann]
 
     def ann_cn_idx(x):
