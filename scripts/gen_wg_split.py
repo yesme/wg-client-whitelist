@@ -192,16 +192,43 @@ for p, orig in cn_pfx.items():
 print(f"carrier families: own {n_cm} prefixes, others {n_cuct} (<=/{args.cuct})")
 
 if args.curated_ips:
-    n_cur = 0
+    # Triage per curated IP (the jdstatic/Cloudflare lesson: never hole a
+    # foreign global-CDN allocation wholesale just because a curated name
+    # resolves into it):
+    #   registry-CN RIR block            -> hole the whole allocation
+    #   foreign block, IP inside a CN-origin ANNOUNCED prefix -> hole that
+    #     prefix only (island at routing granularity)
+    #   foreign block, no CN announcement -> skip (site on a global CDN;
+    #     rides the tunnel by doctrine)
+    cn_ann = sorted((int(ipaddress.ip_network(p).network_address),
+                     int(ipaddress.ip_network(p).broadcast_address))
+                    for p in cn_pfx)
+    cn_ann_st = [a for a, _ in cn_ann]
+
+    def ann_cn_idx(x):
+        i = bisect.bisect_right(cn_ann_st, x) - 1
+        return i if i >= 0 and cn_ann[i][1] >= x else None
+
+    n_reg = n_isl = n_skip = 0
     for line in open(args.curated_ips):
         ip = line.strip()
         if not ip:
             continue
-        i = block_idx(int(ipaddress.IPv4Address(ip)))
-        if i is not None:
-            s, e = blocks[i][0], blocks[i][1]
-            add_range(s, e); n_cur += 1
-    print(f"curated IPs: holed {n_cur} blocks")
+        x = int(ipaddress.IPv4Address(ip))
+        i = block_idx(x)
+        if i is None:
+            continue
+        s, e, pl, cc, reg = blocks[i]
+        if reg == "apnic" and cc == "CN":
+            add_range(s, e); n_reg += 1
+        else:
+            j = ann_cn_idx(x)
+            if j is not None:
+                add_range(cn_ann[j][0], cn_ann[j][1]); n_isl += 1
+            else:
+                n_skip += 1
+    print(f"curated IPs: {n_reg} registry-CN blocks, {n_isl} CN islands, "
+          f"{n_skip} skipped (foreign CDN -> tunnel)")
 
 # ---------- tunnel subnet stays IN allow (cryptokey) ----------
 src_txt = open(args.source, encoding="utf-8").read()

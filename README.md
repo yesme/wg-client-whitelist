@@ -31,8 +31,13 @@ A **hole** is a range kept DIRECT. Which holes to open, in priority order:
    this, hole-punching packets exit via the VPN and P2P dies). Other
    carriers: big aggregates only (default ≥/16 — the knee of the curve;
    the long tail costs 3x prefixes for +2pp).
-5. **curated traffic** — RIR blocks hosting IPs from your must-be-direct
-   list (big CDNs, AI APIs, ...).
+5. **curated traffic** — for IPs from your must-be-direct list: hole the
+   whole RIR allocation only if it is registry-CN; on foreign-registered
+   blocks hole just the CN-announced prefix (island); if the IP sits on a
+   foreign global CDN with no CN announcement, skip it — the site rides
+   the tunnel (the jdstatic/Cloudflare lesson: one curated name on a
+   global CDN otherwise holes the CDN's entire allocation and breaks every
+   other tenant, e.g. grok.com).
 6. **prune** — kill zero-traffic small holes with the sweep evidence.
    **Small holes are fragment amplifiers**: an isolated /24 hole splits
    its neighbors into awkward pieces; removing it lets allow prefixes
