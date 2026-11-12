@@ -133,6 +133,7 @@ market-transferred ranges); the ASN branch above heals them.
 | `nslookup <domain>` | the "Server:" line is cosmetic — judge by the *answer IP's* network |
 | authoritative-NS query | distinguishes poisoned vs blocked vs owner-null answers |
 | `tailscale netcheck` | STUN endpoint should be your home IP, UDP true |
+| island landing test (`tracert -d -h 12 <ip>`, run to completion) | anycast is "anywhere" only globally; from YOUR ingress the landing is fixed. Mainland POP (domestic backbone, <15ms) or HK via CMI (~50ms) → island direct is optimal; US/EU (>150ms) → route it via the tunnel instead. Truncated traces lie: backbone transit hops are not the destination. |
 
 ## Known dead ends
 
