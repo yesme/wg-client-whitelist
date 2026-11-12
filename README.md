@@ -135,6 +135,17 @@ market-transferred ranges); the ASN branch above heals them.
 | `tailscale netcheck` | STUN endpoint should be your home IP, UDP true |
 | island landing test (`tracert -d -h 12 <ip>`, run to completion) | anycast is "anywhere" only globally; from YOUR ingress the landing is fixed. Mainland POP (domestic backbone, <15ms) or HK via CMI (~50ms) → island direct is optimal; US/EU (>150ms) → route it via the tunnel instead. Truncated traces lie: backbone transit hops are not the destination. |
 
+## Prior art & what was borrowed
+
+Survey (2026-11) across four neighborhoods:
+
+- **WireGuard-side, same job**: [ZerGo0/WireGuard-Allowed-IPs-Excluder](https://github.com/ZerGo0/WireGuard-Allowed-IPs-Excluder) (archived 2025) — generic CIDR subtraction for AllowedIPs, but expands blocks into individual IPs (unusable at internet scale), no geo data, no Windows notes. It did ship unit tests — we adopted that (see `tests.py`; interval arithmetic is off-by-one prone: this project shipped two such bugs before testing against brute force). [lmc999/auto-add-routes](https://github.com/lmc999/auto-add-routes) adds CN routes AFTER a full tunnel (AllowedIPs=0/0) — exactly the shape that arms the wireguard-windows killswitch; fine for Linux/other clients, fatal for Tailscale coexistence on Windows. Tutorials/generators: [cute's gist](https://gist.github.com/cute/c3fef305d95edeafa7b48ca4c44dfe41), [zbinlin](https://github.com/zbinlin/blog/blob/master/wireguard-usage.md), [NetRoute generator](https://alexander2k.github.io/netroute-site/guides/wireguard.html).
+- **Data sources**: [misakaio/chnroutes2](https://github.com/misakaio/chnroutes2), [gaoyifan/china-operator-ip](https://github.com/gaoyifan/china-operator-ip) (registry-only lists — the ARIN blind-spot class), [felixonmars/dnsmasq-china-list](https://github.com/felixonmars/dnsmasq-china-list) (our NRPT seed data), [ruijzhan/chnroute](https://github.com/ruijzhan/chnroute) (daily automation via CI — worth copying: scheduled regen + suite runs).
+- **Proxy-client rule engines** (the mainstream alternative): [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) / [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) + Clash/mihomo/sing-box rule-sets — split routing inside a resident proxy client, never touching system routes (and thus never fighting ICS/killswitch, but also never compatible with "no extra client").
+- **Split DNS**: [ChinaDNS](https://github.com/shadowsocks/ChinaDNS), mosdns, [smartdns-rs](https://github.com/mokeyish/smartdns-rs) (native Windows!) — all require owning :53. No prior consumer-grade use of **NRPT** for CN/foreign split DNS was found; NRPT appears in the wild only for enterprise split-DNS (cf. [NetBird#7522](https://github.com/netbirdio/netbird/discussions/7522)).
+
+Not found anywhere else (as of this survey): registry×BGP-origin dual CN detection with intl-arm ASN exclusion, gfwlist-invariant regression suites, fragment-amplifier-aware aggregation with a measured Windows activation curve, and per-island landing verification. Known gap we did not solve: **IPv6** (Excluder handles it; we deliberately stayed v4 — no native v6 at the reference site).
+
 ## Known dead ends
 
 - Local :53 resolvers (AdGuard Home etc.): ICS owns UDP 53, WSL2 depends
