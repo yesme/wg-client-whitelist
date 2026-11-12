@@ -18,7 +18,6 @@
 5ddd.com
 7fresh.com
 abchina.com
-acs.org
 adkwai.com
 adukwai.com
 adups.com
@@ -78,8 +77,6 @@ bdstatic.com
 bdurl.net
 bdydns.com
 bestdo.com
-bigo.sg
-bigolive.tv
 biliapi.com
 biliapi.net
 bilibili.com
@@ -145,7 +142,6 @@ ctobsnssdk.com
 ctrip.com
 cvte.com
 dahuaddns.com
-dalyfeds.com
 dbankcdn.com
 dbankcloud.asia
 dbankcloud.com
@@ -212,7 +208,6 @@ fengkongcloud.com
 firwinds.site
 fnos.net
 foisonad.com
-ford.com
 fqnovel.com
 fqnovelpic.com
 fxltsbl.com
@@ -271,7 +266,6 @@ ixigua.com
 iyong.com
 jd.com
 jdpay.com
-jdstatic.com
 jftechws.com
 jomodns.com
 jpush.io
@@ -500,7 +494,6 @@ weixin.qq.com
 weixinbridge.com
 wetest.net
 whecloud.com
-widgetable.net
 wmzfylgdsz.com
 wondershare.cc
 wondershare.com
@@ -635,7 +628,6 @@ ke.com
 anjuke.com
 fang.com
 koolearn.com
-xueersi.com
 hujiang.com
 hupu.com
 dongqiudi.com
@@ -658,7 +650,6 @@ pingan.com
 ecitic.com
 cebbank.com
 picc.com
-chinalife.com
 guahao.com
 dxy.com
 haodf.com
@@ -796,7 +787,6 @@ pc6.com
 skycn.com
 ctfile.com
 pgyer.com
-dayanzai.com
 myapp.com
 qiniu.com
 qiniudn.com
@@ -834,12 +824,10 @@ msxf.com
 ppdai.com
 lu.com
 aibank.com
-thfund.com
 nffund.com
 chinaamc.com
 bosera.com
 cmfchina.com
-fullgoal.com
 htffund.com
 cicc.com
 htsec.com
@@ -849,7 +837,6 @@ taikang.com
 newchinalife.com
 cntaiping.com
 zhongan.com
-bestpay.com
 apple.com
 mzstatic.com
 cdn-apple.com
@@ -864,7 +851,6 @@ realme.com
 realme.net
 meizu.com
 nubia.com
-lenovo.com
 zui.com
 samsung.com
 windowsupdate.com
